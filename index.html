@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bobo's Fruit Race 🏎️🍎</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #222; font-family: 'Comic Sans MS', 'Chalkboard SE', 'Comic Neue', cursive, sans-serif; }
+  #gameCanvas { display: block; width: 100vw; height: 100vh; }
+  #muteBtn { position: absolute; top: 12px; right: 12px; width: 56px; height: 56px; border: none; border-radius: 50%; background: rgba(255,255,255,0.9); font-size: 26px; cursor: pointer; z-index: 10; box-shadow: 0 3px 10px rgba(0,0,0,0.3); }
+  #muteBtn:active { transform: scale(0.9); }
+</style>
+</head>
+<body>
+<button id="muteBtn" aria-label="Mute">🔊</button>
+<canvas id="gameCanvas"></canvas>
+<script>
+// ===== AUDIO =====
+let audioCtx = null, muted = false;
+function getAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+function playTone(freq, type, duration, vol = 0.15, when = 0) {
+  if (muted) return;
+  const ctx = getAudio();
+  const t = ctx.currentTime + when;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t);
+  gain.gain.setValueAtTime(vol, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start(t);
+  osc.stop(t + duration);
+}
+function playPop() { playTone(600, 'sine', 0.1); setTimeout(() => playTone(800, 'sine', 0.1), 50); }
+function playCrash() { playTone(150, 'sawtooth', 0.3, 0.2); }
+function playWin() {
+  const notes = [523, 587, 659, 698, 784, 880, 988, 1047];
+  notes.forEach((n, i) => playTone(n, 'sine', 0.25, 0.15, i * 0.12));
+}
+function playEngine() {
+  if (muted) return;
+  const ctx = getAudio();
+  const t = ctx.currentTime;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(80, t);
+  osc.frequency.linearRampToValueAtTime(60, t + 0.15);
+  gain.gain.setValueAtTime(0.03, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start(t);
+  osc.stop(t + 0.15);
+}
+function speak(text) {
+  if ('speechSynthesis' in window) {
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.rate = 0.9; utter.pitch = 1.3; utter.volume = 1;
+    window.speechSynthesis.speak(utter);
+  }
+}
+
+// ===== CANVAS SETUP =====
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+let W, H, DPR;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ===== GAME STATE =====
+let state = 'start'; // start | playing | won | lost
+let score = 0, targetScore = 15;
+let laneCount = 4, laneWidth, roadLeft, roadRight;
+let carY, carLane = 1;
+let speed = 0, baseSpeed = 6, maxSpeed = 14;
+let distance = 0, finishLine = 3000;
+let fruits = [], obstacles = [], particles = [];
+let roadOffset = 0, engineTimer = 0;
+let startTime = 0;
+
+// ===== INPUT =====
+let touchStartX = 0;
+function moveLeft() { if (carLane > 0) { carLane--; playEngine(); } }
+function moveRight() { if (carLane < laneCount - 1) { carLane++; playEngine(); } }
+
+document.addEventListener('keydown', e => {
+  if (state !== 'playing') {
+    if (e.code === 'Space' || e.code === 'Enter') { if (state === 'start') startGame(); else if (state === 'won' || state === 'lost') startGame(); }
+    return;
+  }
+  if (e.code === 'ArrowLeft' || e.code === 'KeyA') moveLeft();
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') moveRight();
+});
+
+canvas.addEventListener('touchstart', e => {
+  touchStartX = e.touches[0].clientX;
+  if (state !== 'playing') {
+    if (state === 'start') startGame();
+    else if (state === 'won' || state === 'lost') startGame();
+  }
+}, {passive: true});
+canvas.addEventListener('touchend', e => {
+  if (state !== 'playing') return;
+  const dx = e.changedTouches[0].clientX - touchStartX;
+  if (dx < -30) moveLeft();
+  if (dx > 30) moveRight();
+}, {passive: true});
+canvas.addEventListener('click', e => {
+  if (state === 'start') startGame();
+  else if (state === 'won' || state === 'lost') startGame();
+});
+
+// ===== DRAWING HELPERS =====
+function drawRoundedRect(x, y, w, h, r, fill, stroke) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 3; ctx.stroke(); }
+}
+
+function drawCar(x, y, scale) {
+  const s = scale;
+  // Body
+  drawRoundedRect(x - 30*s, y - 20*s, 60*s, 35*s, 8*s, '#ff4444', '#cc0000');
+  // Roof
+  drawRoundedRect(x - 22*s, y - 32*s, 44*s, 18*s, 6*s, '#ff6666', '#cc0000');
+  // Windshield
+  drawRoundedRect(x - 18*s, y - 28*s, 36*s, 12*s, 4*s, '#87CEEB', '#4682B4');
+  // Wheels
+  ctx.fillStyle = '#333';
+  ctx.beginPath(); ctx.arc(x - 22*s, y + 12*s, 9*s, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + 22*s, y + 12*s, 9*s, 0, Math.PI*2); ctx.fill();
+  // Wheel hubs
+  ctx.fillStyle = '#888';
+  ctx.beginPath(); ctx.arc(x - 22*s, y + 12*s, 4*s, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + 22*s, y + 12*s, 4*s, 0, Math.PI*2); ctx.fill();
+  // Headlights
+  ctx.fillStyle = '#ffff99';
+  ctx.beginPath(); ctx.arc(x - 26*s, y - 8*s, 5*s, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + 26*s, y - 8*s, 5*s, 0, Math.PI*2); ctx.fill();
+  // Smile
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2*s;
+  ctx.beginPath(); ctx.arc(x, y - 5*s, 8*s, 0.2, Math.PI - 0.2); ctx.stroke();
+}
+
+function drawFruit(f) {
+  const x = f.x, y = f.y, s = f.scale || 1;
+  ctx.font = (28*s) + 'px serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(f.emoji, x, y);
+}
+
+function drawObstacle(o) {
+  const x = o.x, y = o.y, s = o.scale || 1;
+  if (o.type === 'rock') {
+    ctx.fillStyle = '#666';
+    ctx.beginPath(); ctx.arc(x, y, 18*s, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#888';
+    ctx.beginPath(); ctx.arc(x - 5*s, y - 5*s, 8*s, 0, Math.PI*2); ctx.fill();
+  } else if (o.type === 'puddle') {
+    ctx.fillStyle = '#4FC3F7';
+    ctx.beginPath(); ctx.ellipse(x, y, 22*s, 14*s, 0, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#81D4FA';
+    ctx.beginPath(); ctx.ellipse(x - 4*s, y - 3*s, 12*s, 8*s, 0, 0, Math.PI*2); ctx.fill();
+  } else if (o.type === 'cone') {
+    ctx.fillStyle = '#FF6F00';
+    ctx.beginPath(); ctx.moveTo(x, y - 22*s); ctx.lineTo(x - 14*s, y + 14*s); ctx.lineTo(x + 14*s, y + 14*s); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(x - 10*s, y - 2*s, 20*s, 6*s);
+  }
+}
+
+function drawParticle(p) {
+  ctx.globalAlpha = p.life;
+  ctx.fillStyle = p.color;
+  ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI*2); ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+// ===== GAME LOGIC =====
+function laneX(lane) {
+  return roadLeft + laneWidth * (lane + 0.5);
+}
+
+function spawnFruit() {
+  const lane = Math.floor(Math.random() * laneCount);
+  fruits.push({
+    x: laneX(lane), y: -40,
+    lane: lane, emoji: ['🍎','🍌','🍇','🍊','🍓','🍑','🍉','🍒'][Math.floor(Math.random()*8)],
+    scale: 1, speed: speed * 0.8 + 2,
+  });
+}
+
+function spawnObstacle() {
+  const lane = Math.floor(Math.random() * laneCount);
+  obstacles.push({
+    x: laneX(lane), y: -40,
+    lane: lane, type: ['rock','puddle','cone'][Math.floor(Math.random()*3)],
+    scale: 1,
+  });
+}
+
+function addParticles(x, y, color, count = 8) {
+  for (let i = 0; i < count; i++) {
+    particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 6,
+      vy: (Math.random() - 0.5) * 6,
+      life: 1, decay: 0.03 + Math.random() * 0.03,
+      color, size: 3 + Math.random() * 5,
+    });
+  }
+}
+
+function startGame() {
+  state = 'playing';
+  score = 0; distance = 0; speed = baseSpeed;
+  carLane = Math.floor(laneCount / 2);
+  fruits = []; obstacles = []; particles = [];
+  roadOffset = 0; engineTimer = 0;
+  startTime = Date.now();
+  getAudio();
+}
+
+function update() {
+  if (state !== 'playing') return;
+
+  // Speed up gradually
+  speed = Math.min(maxSpeed, baseSpeed + distance / 500);
+  distance += speed;
+  roadOffset += speed;
+
+  // Engine sound
+  engineTimer++;
+  if (engineTimer % 15 === 0) playEngine();
+
+  // Spawn
+  if (Math.random() < 0.025) spawnFruit();
+  if (Math.random() < 0.018 && distance > 200) spawnObstacle();
+
+  // Update fruits
+  for (let i = fruits.length - 1; i >= 0; i--) {
+    const f = fruits[i];
+    f.y += speed * 0.8 + 2;
+    // Collect
+    const carX = laneX(carLane);
+    const carYpos = carY;
+    const dx = f.x - carX, dy = f.y - carYpos;
+    if (Math.sqrt(dx*dx + dy*dy) < 45) {
+      score++;
+      playPop();
+      addParticles(f.x, f.y, '#FFD700', 10);
+      fruits.splice(i, 1);
+      if (score >= targetScore) {
+        state = 'won';
+        playWin();
+        speak('Good Game, Bobo!');
+      }
+      continue;
+    }
+    if (f.y > H + 40) fruits.splice(i, 1);
+  }
+
+  // Update obstacles
+  for (let i = obstacles.length - 1; i >= 0; i--) {
+    const o = obstacles[i];
+    o.y += speed;
+    const carX = laneX(carLane);
+    const dx = o.x - carX, dy = o.y - carY;
+    if (Math.sqrt(dx*dx + dy*dy) < 42) {
+      playCrash();
+      addParticles(o.x, o.y, '#FF4444', 12);
+      state = 'lost';
+      speak('Good Game, Bobo!');
+      continue;
+    }
+    if (o.y > H + 40) obstacles.splice(i, 1);
+  }
+
+  // Update particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.life -= p.decay;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  // Win by distance (backup)
+  if (distance >= finishLine && state === 'playing') {
+    state = 'won';
+    playWin();
+    speak('Good Game, Bobo!');
+  }
+}
+
+// ===== RENDER =====
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+
+  // Road
+  laneCount = Math.max(3, Math.min(5, Math.floor(W / 120)));
+  laneWidth = W / laneCount;
+  roadLeft = 0; roadRight = W;
+
+  // Grass
+  ctx.fillStyle = '#4CAF50';
+  ctx.fillRect(0, 0, W, H);
+
+  // Road surface
+  ctx.fillStyle = '#555';
+  ctx.fillRect(roadLeft, 0, roadRight - roadLeft, H);
+
+  // Lane dividers
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 3;
+  ctx.setLineDash([20, 20]);
+  for (let i = 1; i < laneCount; i++) {
+    const x = roadLeft + laneWidth * i;
+    ctx.beginPath(); ctx.moveTo(x, -roadOffset % 40); ctx.lineTo(x, H); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // Road edges
+  ctx.strokeStyle = '#FFD700'; ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.moveTo(roadLeft, 0); ctx.lineTo(roadLeft, H); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(roadRight, 0); ctx.lineTo(roadRight, H); ctx.stroke();
+
+  // Side decorations (trees/flowers)
+  const decoSpacing = 100;
+  const decoOffset = roadOffset % decoSpacing;
+  for (let y = -decoOffset; y < H + decoSpacing; y += decoSpacing) {
+    ctx.font = '28px serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('🌳', roadLeft - 25, y);
+    ctx.fillText('🌸', roadRight + 25, y);
+  }
+
+  // Car position
+  carY = H * 0.78;
+  const carX = laneX(carLane);
+
+  // Draw fruits
+  fruits.forEach(f => drawFruit(f));
+
+  // Draw obstacles
+  obstacles.forEach(o => drawObstacle(o));
+
+  // Draw particles
+  particles.forEach(p => drawParticle(p));
+
+  // Draw car
+  drawCar(carX, carY, 1.2);
+
+  // HUD
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 22px "Comic Sans MS", cursive';
+  ctx.textAlign = 'left';
+  ctx.fillText('🍎 ' + score + ' / ' + targetScore, 16, 36);
+  ctx.textAlign = 'right';
+  ctx.fillText('🏁 ' + Math.floor(distance / 10) + 'm', W - 16, 36);
+
+  // Progress bar
+  const barW = W * 0.4, barH = 10, barX = (W - barW) / 2, barY = 50;
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.fillRect(barX, barY, barW, barH);
+  ctx.fillStyle = '#4CAF50';
+  ctx.fillRect(barX, barY, barW * Math.min(1, distance / finishLine), barH);
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+  ctx.strokeRect(barX, barY, barW, barH);
+
+  // START SCREEN
+  if (state === 'start') {
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(0, 0, W, H);
+
+    // Title
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = 'bold ' + Math.min(64, W/10) + 'px "Comic Sans MS", cursive';
+    ctx.fillStyle = '#FFD700';
+    ctx.shadowColor = '#B8860B'; ctx.shadowBlur = 0; ctx.shadowOffsetX = 4; ctx.shadowOffsetY = 4;
+    ctx.fillText('🏎️ Bobo\'s Fruit Race 🍎', W/2, H*0.22);
+    ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 0;
+
+    // How to play card
+    const cardW = Math.min(480, W * 0.9), cardH = 220, cardX = (W - cardW)/2, cardY = H*0.38;
+    drawRoundedRect(cardX, cardY, cardW, cardH, 20, '#fff', '#FFD700');
+    ctx.fillStyle = '#333'; ctx.font = 'bold 22px "Comic Sans MS", cursive';
+    ctx.fillText('How to Play', W/2, cardY + 32);
+    ctx.font = '16px "Comic Sans MS", cursive';
+    ctx.textAlign = 'left';
+    const tips = ['👆 Swipe or click arrows to change lanes', '🍎 Collect ' + targetScore + ' fruits to win!', '🚧 Avoid rocks, puddles & cones', '🏁 Or race ' + Math.floor(finishLine/10) + ' meters to the finish!'];
+    tips.forEach((t, i) => ctx.fillText(t, cardX + 24, cardY + 68 + i * 32));
+
+    // Start button
+    const btnW = 220, btnH = 60, btnX = (W - btnW)/2, btnY = H*0.72;
+    drawRoundedRect(btnX, btnY, btnW, btnH, 30, 'linear-gradient(135deg, #FFD700, #FF8C00)', '#B8860B');
+    ctx.fillStyle = '#333'; ctx.font = 'bold 26px "Comic Sans MS", cursive';
+    ctx.textAlign = 'center';
+    ctx.fillText('🚦 START RACING!', W/2, btnY + btnH/2 + 8);
+
+    // Car preview
+    drawCar(W/2, H*0.88, 1.5);
+  }
+
+  // WON / LOST
+  if (state === 'won' || state === 'lost') {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+
+    const modalW = Math.min(420, W * 0.85), modalH = 240, modalX = (W - modalW)/2, modalY = (H - modalH)/2;
+    drawRoundedRect(modalX, modalY, modalW, modalH, 24, '#fff', state === 'won' ? '#4CAF50' : '#F44336');
+
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = 'bold ' + Math.min(42, W/8) + 'px "Comic Sans MS", cursive';
+    ctx.fillStyle = state === 'won' ? '#4CAF50' : '#F44336';
+    ctx.fillText(state === 'won' ? '🏆 You Won!' : '💥 Oh no!', W/2, modalY + 55);
+
+    ctx.fillStyle = '#333'; ctx.font = '20px "Comic Sans MS", cursive';
+    ctx.fillText('🍎 Fruits: ' + score + ' / ' + targetScore, W/2, modalY + 105);
+    ctx.fillText('🏁 Distance: ' + Math.floor(distance/10) + 'm', W/2, modalY + 135);
+
+    ctx.font = 'bold ' + Math.min(28, W/12) + 'px "Comic Sans MS", cursive';
+    ctx.fillStyle = '#FF6F00';
+    ctx.fillText('Good Game, Bobo!', W/2, modalY + 180);
+
+    ctx.font = '16px "Comic Sans MS", cursive';
+    ctx.fillStyle = '#888';
+    ctx.fillText('Click or tap to race again!', W/2, modalY + 215);
+  }
+}
+
+// ===== LOOP =====
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// Mute toggle
+document.getElementById('muteBtn').addEventListener('click', e => {
+  e.stopPropagation();
+  muted = !muted;
+  e.target.textContent = muted ? '🔇' : '🔊';
+});
+
+// Start
+loop();
+</script>
+</body>
+</html>
